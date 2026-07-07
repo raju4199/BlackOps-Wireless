@@ -1,0 +1,21 @@
+# Cloned tools (repopulated by install.sh)
+tools/*
+!tools/.gitkeep
+
+# Install logs
+install.log
+
+# Captured artifacts -- never commit these
+*.cap
+*.pcap
+*.pcapng
+*.hccapx
+*.22000
+captures/
+
+# Session logs and generated reports
+logs/
+reports/
+
+# OS junk
+.DS_Store
