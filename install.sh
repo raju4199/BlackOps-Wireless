@@ -69,7 +69,11 @@ APT_PACKAGES=(
   bettercap
   git
   curl
+  usbutils
+  kismet
 )
+
+export DEBIAN_FRONTEND=noninteractive
 
 info "Updating package index..."
 apt-get update -y >>"$LOG_FILE" 2>&1 || warn "apt-get update reported errors, check install.log"

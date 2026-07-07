@@ -51,18 +51,25 @@ tool listed as OK/MISSING), then requires you to type
 - check dependencies again any time
 - check/enable monitor mode on your adapter (with an automatic rfkill-unblock retry if the first attempt fails)
 - launch Airgeddon (full menu-driven WPA/WPS/handshake/eviltwin suite)
-- launch Wifite (automated handshake/PMKID capture)
+- launch Wifite (automated handshake/PMKID capture -- pre-checks hashcat/hcxdumptool/hcxpcapngtool first and warns instead of letting it hang if they're missing)
 - launch Bettercap
-- generate a session report
+- generate a session report (now also emits JSON + CSV alongside the markdown)
 - re-run the installer to pull tool updates
+- run an **adapter/chipset pre-flight check** (`lsusb` + `iw list` cross-referenced against known-good chipsets like Atheros AR9271/RTL8812AU/8811AU and commonly-broken ones like Broadcom/RTL8188EUS)
+- **scan a target and get a WPA3-aware tool recommendation**: classifies each beacon as WEP/OPEN/WPA2/WPA2-WPA3-mixed/WPA3-SAE (+ WPS), warns when a network is pure WPA3-SAE (PMF blocks deauth, so deauth-based capture in either tool won't work against it), and suggests whether Airgeddon or Wifite2 fits better
+- toggle **Kismet companion mode**, which runs Kismet alongside whichever tool you launch so the session also gets a defensive/WIDS view (rogue AP / deauth-flood alerts) of the same traffic, logged and referenced in the report
 
 Every tool launch is logged to `logs/sessions.csv` (session ID, tool,
-start/end time, exit code), and any `.cap`/`.pcap`/`.pcapng`/`.hccapx`/`.22000`
-files created during that session are automatically moved into
-`captures/<session-id>/` so nothing is scattered across `tools/airgeddon`
-or `tools/wifite2`. Run option 7, or `./generate_report.sh` directly, to
-turn that into a markdown report under `reports/` that also echoes the
-current authorized scope from `LAB_AUTHORIZATION.md`.
+start/end time, interface, exit code, Kismet log path), and any
+`.cap`/`.pcap`/`.pcapng`/`.hccapx`/`.22000` files created during that
+session are automatically moved into `captures/<session-id>/` so nothing
+is scattered across `tools/airgeddon` or `tools/wifite2`. Files are
+SHA-256 hashed against a manifest (`captures/.manifest.tsv`) so a handshake
+or PMKID capture already recorded in an earlier session doesn't get
+duplicated. Run option 7, or `./generate_report.sh` directly, to turn all
+of this into a markdown report under `reports/` (plus matching `.json`,
+`-sessions.csv`, and `-captures.csv` files) that also echoes the current
+authorized scope from `LAB_AUTHORIZATION.md`.
 
 ## Updating tools later
 
