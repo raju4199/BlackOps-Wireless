@@ -28,7 +28,7 @@ menu-driven launcher for all three tools.
 ## Quick start (on Kali)
 
 ```bash
-git clone https://github.com/<your-username>/BlackOps-Wireless.git
+git clone https://github.com/raju4199/BlackOps-Wireless.git
 cd BlackOps-Wireless
 sudo ./install.sh      # installs deps + clones airgeddon/wifite2 into tools/
 ```
