@@ -13,6 +13,10 @@ menu-driven launcher for all three tools.
 > laws). `lab.sh` will ask you to confirm this every time you launch a
 > tool -- don't just click through it, actually mean it.
 
+## Architecture
+
+![BlackOps Wireless architecture](docs/architecture.png)
+
 ## What's in here
 
 | File | Purpose |
