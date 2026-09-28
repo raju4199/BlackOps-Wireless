@@ -1,0 +1,8 @@
+# Shell scripts must keep LF endings so they run on Kali/Linux even when
+# edited on Windows (CRLF would cause "$'\r': command not found" errors).
+*.sh   text eol=lf
+*.bash text eol=lf
+
+# Normalize other text; treat the architecture image as binary.
+*.md   text
+*.png  binary
