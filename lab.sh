@@ -17,6 +17,16 @@ CAPTURES_DIR="${REPO_ROOT}/captures"
 SESSIONS_CSV="${LOG_DIR}/sessions.csv"
 CAPTURE_MANIFEST="${CAPTURES_DIR}/.manifest.tsv"
 
+# Shared terminal UI toolkit (boxes, severity badges, tables, signal bars).
+# Falls back to plain color vars below if the library is missing.
+if [[ -f "${REPO_ROOT}/lib/ui.sh" ]]; then
+  # shellcheck source=lib/ui.sh
+  source "${REPO_ROOT}/lib/ui.sh"
+  UI_LIB=1
+else
+  UI_LIB=0
+fi
+
 # Set by "Check / enable monitor mode" so later steps (scan, Kismet
 # companion) don't have to re-ask for the interface every time.
 MON_IFACE=""
@@ -60,6 +70,10 @@ require_root() {
 }
 
 banner() {
+  if (( UI_LIB )); then
+    ui_banner
+    return
+  fi
   echo -e "${c_bold}${c_cyan}"
   echo "  BlackOps Wireless"
   echo "  ------------------"
@@ -400,6 +414,31 @@ check_monitor_mode() {
 # pure WPA3-SAE network and just silently fail (PMF protects management
 # frames, so deauth frames are dropped). This scans beacons first and
 # tells you which of the already-installed tools is actually applicable.
+# severity_for CATEGORY WPS -> "LEVEL|one-line reason"
+# Encapsulates the vulnerability model so the scan table and the report
+# stay in agreement about how a given network is rated.
+severity_for() {
+  local category="$1" wps="$2"
+  if [[ "$category" == "OPEN" ]]; then
+    echo "CRITICAL|No encryption - traffic is plaintext and any device can associate."
+    return
+  fi
+  if [[ "$category" == "WEP" ]]; then
+    echo "CRITICAL|WEP is cryptographically broken - the key is recoverable in minutes."
+    return
+  fi
+  if [[ "$wps" == "yes" ]]; then
+    echo "HIGH|WPS enabled - a PIN/Pixie-Dust attack can bypass the WPA passphrase entirely."
+    return
+  fi
+  case "$category" in
+    WPA2)            echo "MEDIUM|WPA2-PSK - captured handshake/PMKID is offline-crackable if the passphrase is weak." ;;
+    WPA2/WPA3-mixed) echo "LOW|Transition mode - a client can be pushed to negotiate the weaker WPA2." ;;
+    WPA3-SAE)        echo "SECURE|WPA3-SAE with PMF - no deauth/handshake-capture path is exposed here." ;;
+    *)               echo "INFO|Encryption could not be determined - inspect this network manually." ;;
+  esac
+}
+
 recommend_tool_for() {
   local category="$1" wps="$2"
 
@@ -435,8 +474,12 @@ recommend_tool_for() {
 }
 
 scan_and_recommend() {
-  echo -e "${c_bold}Target scan + WPA3-aware tool recommendation${c_reset}"
-  echo "-------------------------------------------------------------"
+  if (( UI_LIB )); then
+    ui_header "Recon scan + vulnerability assessment"
+  else
+    echo -e "${c_bold}Target scan + WPA3-aware tool recommendation${c_reset}"
+    echo "-------------------------------------------------------------"
+  fi
   if ! command -v airodump-ng >/dev/null 2>&1; then
     echo -e "${c_red}[x] airodump-ng not found. Run sudo ./install.sh first.${c_reset}"
     pause
@@ -452,9 +495,10 @@ scan_and_recommend() {
   fi
   read -rp "Scan duration in seconds [15]: " dur
   dur="${dur:-15}"
+  [[ "$dur" =~ ^[0-9]+$ ]] || dur=15
 
   local tmp_prefix="/tmp/boc_scan_$$"
-  echo -e "${c_cyan}Scanning for ${dur}s on ${iface}... (Ctrl+C-safe, will stop automatically)${c_reset}"
+  echo -e "${c_cyan}Scanning for ${dur}s on ${iface}... (will stop automatically)${c_reset}"
   timeout "${dur}" airodump-ng --output-format csv -w "$tmp_prefix" "$iface" >/dev/null 2>&1
   local csv="${tmp_prefix}-01.csv"
   if [[ ! -f "$csv" ]]; then
@@ -469,54 +513,139 @@ scan_and_recommend() {
     wash_out="$(timeout 8 wash -i "$iface" -C 2>/dev/null)"
   fi
 
-  echo
-  printf "%-18s %-25s %-22s %-8s %s\n" "BSSID" "ESSID" "Category" "WPS" "Recommendation"
-  echo "-------------------------------------------------------------------------------------------------"
+  # Parse the AP block into a temp file (one "rank\tfields" row per net) so
+  # we can sort by severity and aggregate a summary in the main shell --
+  # a "| while read" pipe would lose the tallies to a subshell.
+  local rows="${tmp_prefix}.rows"
+  : > "$rows"
+  local total=0 c_crit=0 c_high=0 c_med=0 c_low=0 c_sec=0 c_info=0
 
   # airodump CSV: AP block ends at the first fully-blank line, before the
   # "Station MAC" block. Fields are comma-separated with leading spaces.
-  awk -F',' '
-    NR==1 { next }
-    /^ *$/ { exit }
-    /^BSSID/ { next }
-    { print }
-  ' "$csv" | while IFS=',' read -r bssid firstseen lastseen channel speed privacy cipher auth power beacons iv lanip idlen essid key; do
+  while IFS=',' read -r bssid firstseen lastseen channel speed privacy cipher auth power beacons iv lanip idlen essid key; do
     bssid="$(echo "$bssid" | xargs)"
     [[ -n "$bssid" ]] || continue
     privacy="$(echo "$privacy" | xargs)"
     auth="$(echo "$auth" | xargs)"
+    channel="$(echo "$channel" | xargs)"
+    power="$(echo "$power" | xargs)"
     essid="$(echo "$essid" | xargs)"
     [[ -n "$essid" ]] || essid="(hidden)"
 
-    local_category="Unknown"
-    if [[ "$privacy" == *WEP* ]]; then
-      local_category="WEP"
-    elif [[ -z "$privacy" || "$privacy" == "OPN" ]]; then
-      local_category="OPEN"
-    elif [[ "$auth" == *WPA3* && "$auth" == *WPA2* ]]; then
-      local_category="WPA2/WPA3-mixed"
-    elif [[ "$auth" == *WPA3* ]]; then
-      local_category="WPA3-SAE"
-    elif [[ "$auth" == *WPA2* || "$auth" == *PSK* ]]; then
-      local_category="WPA2"
+    # airodump puts the suite (WPA2/WPA3/WEP/OPN) in the Privacy column and
+    # the key-mgmt (PSK/SAE/MGT) in the Authentication column, so classify
+    # against BOTH -- checking only one field misreads WPA3-SAE and mixed.
+    local enc="${privacy} ${auth}"
+    local category="Unknown"
+    if [[ "$enc" == *WEP* ]]; then
+      category="WEP"
+    elif [[ -z "$privacy" || "$privacy" == *OPN* ]]; then
+      category="OPEN"
+    elif { [[ "$enc" == *WPA3* || "$auth" == *SAE* ]]; } && { [[ "$enc" == *WPA2* || "$auth" == *PSK* ]]; }; then
+      category="WPA2/WPA3-mixed"
+    elif [[ "$enc" == *WPA3* || "$auth" == *SAE* ]]; then
+      category="WPA3-SAE"
+    elif [[ "$enc" == *WPA* || "$auth" == *PSK* ]]; then
+      category="WPA2"
     fi
 
-    wps="no"
+    local wps="no"
     if [[ -n "$wash_out" ]] && echo "$wash_out" | grep -qi "$bssid"; then
       wps="yes"
     fi
 
-    rec="$(recommend_tool_for "$local_category" "$wps")"
-    printf "%-18s %-25s %-22s %-8s %s\n" "$bssid" "$essid" "$local_category" "$wps" "$rec"
+    local sev_line level reason rank
+    sev_line="$(severity_for "$category" "$wps")"
+    level="${sev_line%%|*}"
+    reason="${sev_line#*|}"
+    if (( UI_LIB )); then rank="$(sev_rank "$level")"; else rank=0; fi
 
-    if [[ "$local_category" == "WPA3-SAE" ]]; then
-      echo -e "  ${c_yellow}[!] ${essid} (${bssid}) is pure WPA3-SAE: PMF blocks deauth frames, so deauth-based capture in Airgeddon/Wifite2 will not work against it.${c_reset}"
-    fi
-  done
+    total=$((total+1))
+    case "$level" in
+      CRITICAL) c_crit=$((c_crit+1)) ;;
+      HIGH)     c_high=$((c_high+1)) ;;
+      MEDIUM)   c_med=$((c_med+1)) ;;
+      LOW)      c_low=$((c_low+1)) ;;
+      SECURE)   c_sec=$((c_sec+1)) ;;
+      *)        c_info=$((c_info+1)) ;;
+    esac
 
-  rm -f "${tmp_prefix}"*.csv "${tmp_prefix}"*.cap "${tmp_prefix}"*.kismet.* "${tmp_prefix}"*.log.csv 2>/dev/null
+    # Tab-separated so essid spaces survive; sort key is the leading rank.
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$rank" "$level" "$bssid" "$essid" "$channel" "$power" "$category|$wps" "$reason" >> "$rows"
+  done < <(awk -F',' 'NR==1{next} /^ *$/{exit} /^BSSID/{next} {print}' "$csv")
+
+  if (( total == 0 )); then
+    echo
+    (( UI_LIB )) && ui_warn "No access points seen in ${dur}s. Move closer, extend the duration, or confirm monitor mode." \
+                 || echo -e "${c_yellow}[!] No access points seen.${c_reset}"
+    rm -f "${tmp_prefix}"* 2>/dev/null
+    pause
+    return
+  fi
+
+  # ---- findings table (sorted worst-first, then strongest signal) ----
   echo
-  echo "Reminder: only scan/target BSSIDs listed in LAB_AUTHORIZATION.md."
+  if (( UI_LIB )); then
+    printf "  ${U_BOLD}%-10s %-17s %-20s %-4s %-7s %s${U_RESET}\n" "SEVERITY" "BSSID" "ESSID" "CH" "SIGNAL" "ENCRYPTION / WPS"
+    ui_rule
+    # sort: rank desc, then signal (power) desc
+    sort -t$'\t' -k1,1nr -k6,6nr "$rows" | while IFS=$'\t' read -r rank level bssid essid channel power catwps reason; do
+      local category="${catwps%%|*}" wps="${catwps#*|}"
+      local wtag=""; [[ "$wps" == "yes" ]] && wtag=" ${U_BYELLOW}+WPS${U_RESET}"
+      printf "  %b %-17s %-20.20s %-4s %b  %b\n" \
+        "$(sev_badge "$level")" "$bssid" "$essid" "${channel:-?}" "$(ui_signal_bar "$power")" "${category}${wtag}"
+    done
+  else
+    printf "%-10s %-18s %-22s %-6s %s\n" "SEVERITY" "BSSID" "ESSID" "CH" "ENCRYPTION"
+    echo "-------------------------------------------------------------------------------"
+    sort -t$'\t' -k1,1nr -k6,6nr "$rows" | while IFS=$'\t' read -r rank level bssid essid channel power catwps reason; do
+      printf "%-10s %-18s %-22s %-6s %s\n" "$level" "$bssid" "$essid" "${channel:-?}" "${catwps%%|*}"
+    done
+  fi
+
+  # ---- findings summary ----
+  echo
+  if (( UI_LIB )); then
+    echo -e "  ${U_BOLD}Findings summary${U_RESET}  (${total} networks seen)"
+    echo -e "    $(sev_badge CRITICAL) ${c_crit}   $(sev_badge HIGH) ${c_high}   $(sev_badge MEDIUM) ${c_med}   $(sev_badge LOW) ${c_low}   $(sev_badge SECURE) ${c_sec}"
+  else
+    echo "Findings: CRITICAL=${c_crit} HIGH=${c_high} MEDIUM=${c_med} LOW=${c_low} SECURE=${c_sec} (of ${total})"
+  fi
+
+  # ---- top risks with explanation + tool recommendation ----
+  echo
+  if (( UI_LIB )); then ui_header "Priority findings"; else echo "== Priority findings =="; fi
+  local shown=0
+  while IFS=$'\t' read -r rank level bssid essid channel power catwps reason; do
+    (( rank >= 3 )) || continue        # CRITICAL/HIGH/MEDIUM only
+    (( shown < 5 )) || break
+    shown=$((shown+1))
+    local category="${catwps%%|*}" wps="${catwps#*|}"
+    if (( UI_LIB )); then
+      echo
+      echo -e "  $(sev_badge "$level") ${U_BOLD}${essid}${U_RESET} ${U_DIM}(${bssid}, ch ${channel:-?})${U_RESET}"
+      ui_kv "Why it's flagged" "$reason"
+      ui_kv "Recommended path" "$(recommend_tool_for "$category" "$wps")"
+    else
+      echo "[$level] ${essid} (${bssid}) - ${reason}"
+      echo "     -> $(recommend_tool_for "$category" "$wps")"
+    fi
+  done < <(sort -t$'\t' -k1,1nr -k6,6nr "$rows")
+  if (( shown == 0 )); then
+    (( UI_LIB )) && ui_ok "No CRITICAL/HIGH/MEDIUM findings - every network seen is hardened." \
+                 || echo "No CRITICAL/HIGH/MEDIUM findings."
+  fi
+
+  (( UI_LIB )) && ui_legend
+
+  rm -f "${tmp_prefix}"*.csv "${tmp_prefix}"*.cap "${tmp_prefix}"*.kismet.* "${tmp_prefix}"*.log.csv "$rows" 2>/dev/null
+  echo
+  if (( UI_LIB )); then
+    ui_warn "Only associate with, capture, or attack BSSIDs listed in LAB_AUTHORIZATION.md. Everything above is passive discovery."
+  else
+    echo "Reminder: only scan/target BSSIDs listed in LAB_AUTHORIZATION.md."
+  fi
   pause
 }
 
@@ -748,6 +877,99 @@ generate_report() {
   pause
 }
 
+# ---------------- guided pentest workflow ----------------
+# Walks a tester through the correct order of a WiFi engagement so steps
+# can't be run out of sequence. Every step reuses the same functions the
+# manual menu does -- this only enforces the flow and narrates it.
+guided_workflow() {
+  local TOTAL=7
+  clear
+  if (( UI_LIB )); then
+    ui_banner
+    ui_header "Guided WiFi pentest workflow"
+    echo
+    echo -e "  This walks you through the standard engagement order:"
+    echo -e "    ${ARROW} authorize ${ARROW} adapter check ${ARROW} monitor mode ${ARROW} recon"
+    echo -e "    ${ARROW} pick a target ${ARROW} run the tool ${ARROW} report"
+    echo
+    ui_info "You can stop at any prompt with Ctrl+C; nothing runs until you confirm each step."
+  else
+    banner
+    echo "Guided WiFi pentest workflow"
+  fi
+  read -rp "Press Enter to begin (or Ctrl+C to abort)... " _
+
+  # --- Step 1: scope / authorization ---
+  (( UI_LIB )) && ui_step 1 $TOTAL "Confirm scope & authorization" || echo "== Step 1: scope =="
+  echo "  Current authorized scope on record:"
+  echo
+  awk '/^## 2\. Scope/{flag=1} /^## 3\./{flag=0} flag' "$AUTH_FILE" 2>/dev/null | sed 's/^/    /'
+  echo
+  if get_authorized_target 2>/dev/null; then
+    (( UI_LIB )) && ui_ok "Scope table has a usable target: ${TARGET_SSID:-<no SSID>} (${TARGET_BSSID})" \
+                 || echo "  Target on record: ${TARGET_BSSID}"
+  else
+    (( UI_LIB )) && ui_warn "No specific BSSID in the scope table yet. Recon still works, but the scoped DoS test (step 6) will refuse to run until you fill it in." \
+                 || echo "  No BSSID in scope table yet."
+  fi
+  read -rp "  Proceed? [Y/n] " a; [[ "$a" =~ ^[Nn]$ ]] && return
+
+  # --- Step 2: adapter / chipset pre-flight ---
+  (( UI_LIB )) && ui_step 2 $TOTAL "Adapter & chipset pre-flight" || echo "== Step 2: adapter =="
+  check_adapter_chipset
+  read -rp "  Continue to monitor mode? [Y/n] " a; [[ "$a" =~ ^[Nn]$ ]] && return
+
+  # --- Step 3: monitor mode ---
+  (( UI_LIB )) && ui_step 3 $TOTAL "Enable monitor mode" || echo "== Step 3: monitor mode =="
+  check_monitor_mode
+  if [[ -z "$MON_IFACE" ]]; then
+    (( UI_LIB )) && ui_warn "No monitor interface recorded. Recon and attacks need one -- you can set it inside each step, but it's cleaner to enable it here." \
+                 || echo "  No monitor interface set."
+    read -rp "  Continue anyway? [y/N] " a; [[ "$a" =~ ^[Yy]$ ]] || return
+  fi
+
+  # --- Step 4: recon + vulnerability assessment ---
+  (( UI_LIB )) && ui_step 4 $TOTAL "Recon scan + vulnerability assessment" || echo "== Step 4: recon =="
+  scan_and_recommend
+
+  # --- Step 5: pick a target & tool ---
+  (( UI_LIB )) && ui_step 5 $TOTAL "Select tool for your authorized target" || echo "== Step 5: choose tool =="
+  echo "  Choose the tool that matches the recommendation for your in-scope target:"
+  echo "    1) Airgeddon   (menu-driven WPA/WPS/handshake/evil-twin suite)"
+  echo "    2) Wifite      (automated handshake/PMKID capture + crack)"
+  echo "    3) Bettercap   (recon / MITM framework)"
+  echo "    4) Scoped DoS / resilience test (mdk4, single in-scope BSSID)"
+  echo "    0) Skip to reporting"
+  read -rp "  Choice: " t
+  case "$t" in
+    1) launch_airgeddon ;;
+    2) launch_wifite ;;
+    3) launch_bettercap ;;
+    4) launch_dos_test ;;
+    *) : ;;
+  esac
+
+  # --- Step 6: captures ---
+  (( UI_LIB )) && ui_step 6 $TOTAL "Harvest captures" || echo "== Step 6: captures =="
+  if (( UI_LIB )); then
+    ui_info "Any handshake/PMKID/pcap produced above was auto-moved into captures/<session-id>/ and de-duplicated against the manifest."
+    ui_info "Kismet companion mode (main menu #11) adds a defensive WIDS log to each session if you want a blue-team view."
+  else
+    echo "  Captures auto-harvested into captures/<session-id>/."
+  fi
+  read -rp "  Continue to report? [Y/n] " a; [[ "$a" =~ ^[Nn]$ ]] && return
+
+  # --- Step 7: report ---
+  (( UI_LIB )) && ui_step 7 $TOTAL "Generate session report" || echo "== Step 7: report =="
+  generate_report
+
+  if (( UI_LIB )); then
+    echo
+    ui_ok "Guided workflow complete. Reports written under reports/ (md/html/json/csv)."
+  fi
+  pause
+}
+
 # ---------------- main ----------------
 require_root
 clear
@@ -773,6 +995,7 @@ while true; do
   echo "10) Scan target + WPA3-aware tool recommendation"
   printf "11) Toggle Kismet companion mode (currently: %s)\n" "$([[ "$KISMET_ENABLED" == "true" ]] && echo ON || echo OFF)"
   echo "12) Scoped DoS / resilience test (mdk4, single-target only)"
+  echo -e "${c_bold}${c_green}13) Guided pentest workflow (recommended -- runs steps in order)${c_reset}"
   echo " 0) Exit"
   echo
   read -rp "Choice: " choice
@@ -789,6 +1012,7 @@ while true; do
     10) scan_and_recommend ;;
     11) toggle_kismet_companion ;;
     12) launch_dos_test ;;
+    13) guided_workflow ;;
     0) echo "Bye."; exit 0 ;;
     *) echo "Invalid choice." ; sleep 1 ;;
   esac

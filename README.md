@@ -22,30 +22,79 @@ menu-driven launcher for all three tools.
 | File | Purpose |
 |---|---|
 | `install.sh` | Installs the aircrack-ng toolchain + related apt packages, clones Airgeddon and Wifite2 into `tools/`. |
-| `lab.sh` | Interactive menu: dependency check -> authorization gate -> monitor mode check -> launch Airgeddon / Wifite / Bettercap. |
+| `lab.sh` | Interactive menu: dependency check -> authorization gate -> monitor mode check -> launch Airgeddon / Wifite / Bettercap. Includes a **guided workflow** that runs the steps in the correct order. |
+| `lib/ui.sh` | Shared terminal UI toolkit (boxed headers, colour-coded severity badges, aligned tables, signal-strength bars). Purely presentational; degrades to plain ASCII when piped to a file or when `NO_COLOR` is set. |
 | `LAB_AUTHORIZATION.md` | Fill this out first. Defines what's in scope. |
 | `SETUP_NOTES.md` | VM + USB WiFi adapter passthrough (VirtualBox/VMware), monitor-mode verification. |
 | `generate_report.sh` | Builds a markdown report from `logs/sessions.csv` + `captures/`, cross-referenced against the scope table in `LAB_AUTHORIZATION.md`. |
 | `tools/` | Where Airgeddon/Wifite2 get cloned (git-ignored, populated by `install.sh`). |
 | `logs/`, `captures/`, `reports/` | Created automatically by `lab.sh` -- session log, harvested capture files, generated reports (all git-ignored). |
 
-## Quick start (on Kali)
+## Installation on Kali Linux
+
+### Prerequisites
+
+- **Kali Linux** (bare metal or a VM). The installer targets Kali/Debian
+  `apt`; it will warn but continue on other Debian-based distros.
+- **Root / sudo** access.
+- A **monitor-mode + injection capable USB WiFi adapter** (e.g. Atheros
+  AR9271, Realtek RTL8812AU/8811AU, Ralink RT3070). Onboard laptop WiFi
+  behind a VM almost never works -- see [`SETUP_NOTES.md`](SETUP_NOTES.md).
+- `git` (ships with Kali; `sudo apt install -y git` if missing).
+
+### Step 1 -- Get the code
 
 ```bash
 git clone https://github.com/raju4199/BlackOps-Wireless.git
 cd BlackOps-Wireless
-sudo ./install.sh      # installs deps + clones airgeddon/wifite2 into tools/
 ```
 
-Then, before touching anything:
+### Step 2 -- Run the installer
 
-1. Open `LAB_AUTHORIZATION.md` and fill in section 1-5 for your setup.
-2. Read `SETUP_NOTES.md` and pass your USB WiFi adapter into the VM.
-3. Run the launcher:
+```bash
+sudo ./install.sh
+```
+
+This installs the aircrack-ng toolchain and everything Airgeddon / Wifite /
+Bettercap expect (mdk4, hcxtools, hcxdumptool, reaver, bully, hashcat,
+kismet, ...), then clones Airgeddon and Wifite2 into `tools/`. It's
+**idempotent** -- re-run it any time to pull tool updates. Full log goes to
+`install.log`.
+
+If any package fails (e.g. not in your repos), the installer lists it at the
+end and keeps going; Airgeddon re-checks its own dependencies on launch too.
+
+### Step 3 -- Define your scope
+
+```bash
+nano LAB_AUTHORIZATION.md      # fill in sections 1-5
+```
+
+Put your **test AP's SSID and BSSID** in the section 2 scope table
+(`AA:BB:CC:DD:EE:FF` format). The scoped DoS/resilience test refuses to run
+until this is filled in, and reports echo this scope so results stay
+traceable.
+
+### Step 4 -- Attach your adapter & verify monitor mode
+
+Pass your USB adapter into the VM (see [`SETUP_NOTES.md`](SETUP_NOTES.md)),
+then confirm it's visible:
+
+```bash
+iw dev                                                # a wlanX interface exists
+iw list | grep -A10 "Supported interface modes"       # look for "monitor"
+```
+
+### Step 5 -- Launch
 
 ```bash
 sudo ./lab.sh
 ```
+
+> **Tip:** for a fresh run, just pick **option 13 (Guided pentest
+> workflow)** -- it walks every step below in the correct order.
+
+## How to use it
 
 On launch, `lab.sh` prints a banner and runs an Airgeddon-style dependency
 self-check (same idea as Airgeddon's own startup screen -- every required
@@ -62,6 +111,41 @@ tool listed as OK/MISSING), then requires you to type
 - run an **adapter/chipset pre-flight check** (`lsusb` + `iw list` cross-referenced against known-good chipsets like Atheros AR9271/RTL8812AU/8811AU and commonly-broken ones like Broadcom/RTL8188EUS)
 - **scan a target and get a WPA3-aware tool recommendation**: classifies each beacon as WEP/OPEN/WPA2/WPA2-WPA3-mixed/WPA3-SAE (+ WPS), warns when a network is pure WPA3-SAE (PMF blocks deauth, so deauth-based capture in either tool won't work against it), and suggests whether Airgeddon or Wifite2 fits better
 - toggle **Kismet companion mode**, which runs Kismet alongside whichever tool you launch so the session also gets a defensive/WIDS view (rogue AP / deauth-flood alerts) of the same traffic, logged and referenced in the report
+- run the **guided pentest workflow** (menu option 13), which walks you through the whole engagement in the right order (authorize -> adapter pre-flight -> monitor mode -> recon -> pick target/tool -> harvest captures -> report) so nothing runs out of sequence
+
+## Reading the recon output
+
+The scan (menu option 10, or step 4 of the guided workflow) doesn't just
+list APs -- it rates each one and sorts the table worst-first, so the
+networks that actually need attention are at the top:
+
+```
+  SEVERITY   BSSID             ESSID              CH   SIGNAL  ENCRYPTION / WPS
+────────────────────────────────────────────────────────────────
+   CRITICAL  AA:BB:CC:00:00:01 CoffeeShop         6    ████░  OPEN
+   CRITICAL  AA:BB:CC:00:00:06 OldPrinter         3    █░░░░  WEP
+  [  HIGH  ] AA:BB:CC:00:00:02 Home_2G            11   ███░░  WPA2 +WPS
+  [ MEDIUM ] AA:BB:CC:00:00:03 Office             1    ██░░░  WPA2
+  [  LOW   ] AA:BB:CC:00:00:04 NewRouter          36   ████░  WPA2/WPA3-mixed
+  [ SECURE ] AA:BB:CC:00:00:05 Secure_AP          44   ████░  WPA3-SAE
+```
+
+Below the table it prints a findings tally and a **Priority findings**
+panel that, for each CRITICAL/HIGH/MEDIUM network, explains *why* it's
+flagged and which installed tool fits the attack path.
+
+### Severity model
+
+| Severity | Meaning | Typical networks |
+|---|---|---|
+| **CRITICAL** | No or broken encryption -- anyone in range gets in | OPEN, WEP |
+| **HIGH** | A practical attack path bypasses the passphrase | WPS PIN/Pixie-Dust, WEP key recovery |
+| **MEDIUM** | Crackable only if the passphrase is weak | WPA2-PSK (handshake/PMKID capture) |
+| **LOW** | Hardened but with a known caveat | WPA2/WPA3 transition (downgrade) |
+| **SECURE** | No attack path exposed here | WPA3-SAE + PMF |
+
+The same rating logic (`severity_for` in `lab.sh`) drives both the table
+and the priority panel, so they never disagree.
 
 Every tool launch is logged to `logs/sessions.csv` (session ID, tool,
 start/end time, interface, exit code, Kismet log path), and any
